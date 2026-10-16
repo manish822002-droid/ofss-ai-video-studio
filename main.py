@@ -1,10 +1,8 @@
 
 import os
 import re
-import asyncio
 import tempfile
 import textwrap
-from pathlib import Path
 
 import edge_tts
 from fastapi import FastAPI, HTTPException
@@ -12,9 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageFont
-from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, vfx
+from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
 
-app = FastAPI(title="OFSS AI Video Studio API", version="1.0.0")
+app = FastAPI(title="OFSS AI Video Studio API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,10 +21,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class VideoRequest(BaseModel):
     script: str = Field(min_length=10, max_length=12000)
     voice: str = "hi-IN-SwaraNeural"
     format: str = "landscape"
+
 
 @app.get("/")
 def home():
@@ -36,78 +36,201 @@ def home():
         "endpoint": "/api/video"
     }
 
-def split_script(script):
-    parts = re.split(r'(?<=[.!?।])\s+', script.strip())
-    parts = [p.strip() for p in parts if p.strip()]
-    return parts or [script.strip()]
+
+def split_script(script, max_scenes=30):
+    script = re.sub(r"\s+", " ", script.strip())
+    sentences = re.split(r'(?<=[.!?।])\s+', script)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    scenes = []
+    current = ""
+
+    for sentence in sentences:
+        if current and len(current) + len(sentence) > 260:
+            scenes.append(current)
+            current = sentence
+        else:
+            current = (current + " " + sentence).strip()
+
+    if current:
+        scenes.append(current)
+
+    if len(scenes) > max_scenes:
+        merged = []
+        for i in range(max_scenes):
+            start = round(i * len(scenes) / max_scenes)
+            end = round((i + 1) * len(scenes) / max_scenes)
+            merged.append(" ".join(scenes[start:end]))
+        scenes = merged
+
+    return scenes or [script]
+
+
+def get_font(size, bold=False):
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"
+    ]
+
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
+
+    return ImageFont.load_default()
+
+
+def wrap_text(draw, text, font, max_width):
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        test = (current + " " + word).strip()
+        box = draw.textbbox((0, 0), test, font=font)
+
+        if box[2] <= max_width or not current:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines
+
 
 def make_scene(text, number, size, folder):
     width, height = size
-    image = Image.new("RGB", size, (15, 23, 42))
+    image = Image.new("RGB", size, (12, 22, 40))
     draw = ImageDraw.Draw(image)
 
-    try:
-        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        font = ImageFont.truetype(font_path, max(22, width // 28))
-        small_font = ImageFont.truetype(font_path, max(18, width // 45))
-    except OSError:
-        font = ImageFont.load_default()
-        small_font = ImageFont.load_default()
+    # Cinematic gradient background
+    for y in range(height):
+        ratio = y / max(1, height)
+        color = (
+            int(20 - 12 * ratio),
+            int(48 - 35 * ratio),
+            int(75 - 48 * ratio)
+        )
+        draw.line((0, y, width, y), fill=color)
 
-    draw.text((width // 12, height // 10),
-              "OFSS AI VIDEO STUDIO",
-              fill=(80, 200, 255), font=small_font)
+    # Decorative circles
+    draw.ellipse(
+        (int(width * 0.65), int(height * 0.08),
+         int(width * 1.05), int(height * 0.48)),
+        outline=(45, 125, 155),
+        width=5
+    )
 
-    draw.text((width // 12, height // 5),
-              f"SCENE {number:02d}",
-              fill=(255, 190, 80), font=small_font)
+    title_font = get_font(max(18, width // 45), True)
+    scene_font = get_font(max(18, width // 55), True)
+    body_font = get_font(max(22, width // 30))
+    footer_font = get_font(max(14, width // 70))
 
-    max_chars = max(18, width // max(12, width // 35))
-    lines = textwrap.wrap(text, width=max_chars) or [text]
-    max_lines = 7 if height > width else 12
-    lines = lines[:max_lines]
+    draw.text(
+        (int(width * 0.08), int(height * 0.09)),
+        "OFSS AI VIDEO STUDIO",
+        fill=(95, 215, 255),
+        font=title_font
+    )
+
+    draw.text(
+        (int(width * 0.08), int(height * 0.20)),
+        f"SCENE {number:02d}",
+        fill=(255, 190, 90),
+        font=scene_font
+    )
+
+    lines = wrap_text(
+        draw,
+        text,
+        body_font,
+        int(width * 0.82)
+    )
+
+    max_lines = 8 if width > height else 15
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1] + "..."
 
     line_height = max(35, height // 14)
-    y = height // 3
+    y = int(height * 0.34)
 
     for line in lines:
-        draw.text((width // 12, y), line, fill="white", font=font)
+        draw.text(
+            (int(width * 0.08) + 2, y + 2),
+            line,
+            fill=(0, 0, 0),
+            font=body_font
+        )
+        draw.text(
+            (int(width * 0.08), y),
+            line,
+            fill=(255, 255, 255),
+            font=body_font
+        )
         y += line_height
 
+    draw.text(
+        (int(width * 0.08), int(height * 0.93)),
+        "EDUCATIONAL DOCUMENTARY",
+        fill=(165, 185, 205),
+        font=footer_font
+    )
+
     path = os.path.join(folder, f"scene_{number:03d}.jpg")
-    image.save(path, quality=88)
+    image.save(path, quality=90)
     return path
 
 
 def camera_motion(clip, duration, scene_number):
-    zoom = 1.0 + (0.08 * min(duration, 5) / 5)
+    zoom = 0.06
 
     if scene_number % 2 == 0:
         animated = clip.resized(
-            lambda t: 1.0 + (zoom - 1.0) * t / max(duration, 0.1)
+            lambda t: 1 + zoom * min(1, t / max(duration, 0.1))
         )
     else:
         animated = clip.resized(
-            lambda t: zoom - (zoom - 1.0) * t / max(duration, 0.1)
+            lambda t: 1 + zoom * (
+                1 - min(1, t / max(duration, 0.1))
+            )
         )
 
     return animated.with_position("center")
+
 
 @app.post("/api/video")
 async def create_video(request: VideoRequest):
     script = request.script.strip()
 
     if len(script) < 10:
-        raise HTTPException(status_code=400, detail="Script is too short.")
+        raise HTTPException(
+            status_code=400,
+            detail="Script is too short."
+        )
 
     if request.format not in ("landscape", "portrait"):
-        raise HTTPException(status_code=400, detail="Invalid video format.")
+        raise HTTPException(
+            status_code=400,
+            detail="Choose landscape or portrait."
+        )
 
     workdir = tempfile.mkdtemp(prefix="ofss_video_")
     audio_path = os.path.join(workdir, "voice.mp3")
     output_path = os.path.join(workdir, "ofss_video.mp4")
 
+    audio = None
+    video = None
+    clips = []
+
     try:
+        # Generate AI voice
         communicate = edge_tts.Communicate(
             script,
             request.voice,
@@ -115,8 +238,13 @@ async def create_video(request: VideoRequest):
         )
         await communicate.save(audio_path)
 
-        scenes = split_script(script)[:30]
-        size = (1280, 720) if request.format == "landscape" else (720, 1280)
+        scenes = split_script(script, 30)
+
+        size = (
+            (1280, 720)
+            if request.format == "landscape"
+            else (720, 1280)
+        )
 
         image_paths = [
             make_scene(text, i + 1, size, workdir)
@@ -124,19 +252,35 @@ async def create_video(request: VideoRequest):
         ]
 
         audio = AudioFileClip(audio_path)
-        weights = [max(1, len(s.split())) for s in scenes]
-        total_weight = sum(weights)
-        clips = []
 
-        
-for i, path in enumerate(image_paths):
-    duration = audio.duration * weights[i] / total_weight
-    clip = ImageClip(path).with_duration(duration)
-    clip = camera_motion(clip, duration, i + 1)
-    clips.append(clip)
+        weights = [
+            max(1, len(scene.split()))
+            for scene in scenes
+        ]
+        total_weight = sum(weights) or 1
 
+        for i, path in enumerate(image_paths):
+            duration = (
+                audio.duration * weights[i] / total_weight
+            )
 
-        video = concatenate_videoclips(clips, method="compose")
+            clip = ImageClip(path).with_duration(
+                max(0.1, duration)
+            )
+
+            clip = camera_motion(
+                clip,
+                duration,
+                i + 1
+            )
+
+            clips.append(clip)
+
+        video = concatenate_videoclips(
+            clips,
+            method="compose"
+        )
+
         video = video.with_audio(audio)
 
         video.write_videofile(
@@ -144,21 +288,45 @@ for i, path in enumerate(image_paths):
             fps=24,
             codec="libx264",
             audio_codec="aac",
+            preset="ultrafast",
             logger=None
         )
 
         video.close()
+        video = None
+
         audio.close()
+        audio = None
+
+        for clip in clips:
+            clip.close()
+
+        clips = []
 
         return FileResponse(
             output_path,
             media_type="video/mp4",
-            filename="ofss-ai-video.mp4",
-            background=None
+            filename="ofss-ai-video.mp4"
         )
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Video creation failed: {str(exc)[:300]}"
         )
+
+    finally:
+        if video is not None:
+            video.close()
+
+        if audio is not None:
+            audio.close()
+
+        for clip in clips:
+            try:
+                clip.close()
+            except Exception:
+                pass
