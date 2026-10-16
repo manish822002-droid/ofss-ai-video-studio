@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageFont
-from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, vfx
 
 app = FastAPI(title="OFSS AI Video Studio API", version="1.0.0")
 
@@ -78,6 +78,21 @@ def make_scene(text, number, size, folder):
     image.save(path, quality=88)
     return path
 
+
+def camera_motion(clip, duration, scene_number):
+    zoom = 1.0 + (0.08 * min(duration, 5) / 5)
+
+    if scene_number % 2 == 0:
+        animated = clip.resized(
+            lambda t: 1.0 + (zoom - 1.0) * t / max(duration, 0.1)
+        )
+    else:
+        animated = clip.resized(
+            lambda t: zoom - (zoom - 1.0) * t / max(duration, 0.1)
+        )
+
+    return animated.with_position("center")
+
 @app.post("/api/video")
 async def create_video(request: VideoRequest):
     script = request.script.strip()
@@ -113,10 +128,13 @@ async def create_video(request: VideoRequest):
         total_weight = sum(weights)
         clips = []
 
-        for i, path in enumerate(image_paths):
-            duration = audio.duration * weights[i] / total_weight
-            clip = ImageClip(path).with_duration(duration)
-            clips.append(clip)
+        
+for i, path in enumerate(image_paths):
+    duration = audio.duration * weights[i] / total_weight
+    clip = ImageClip(path).with_duration(duration)
+    clip = camera_motion(clip, duration, i + 1)
+    clips.append(clip)
+
 
         video = concatenate_videoclips(clips, method="compose")
         video = video.with_audio(audio)
