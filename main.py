@@ -1,18 +1,24 @@
 
 import os
 import re
+import shutil
+import subprocess
 import tempfile
-import textwrap
+from pathlib import Path
 
 import edge_tts
-from fastapi import FastAPI, HTTPException
+import imageio_ffmpeg
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from PIL import Image, ImageDraw, ImageFont
-from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+from starlette.background import BackgroundTask
 
-app = FastAPI(title="OFSS AI Video Studio API", version="2.0.0")
+
+app = FastAPI(
+    title="OFSS AI Video Studio API",
+    version="2.1.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,312 +27,251 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-class VideoRequest(BaseModel):
-    script: str = Field(min_length=10, max_length=12000)
-    voice: str = "hi-IN-SwaraNeural"
-    format: str = "landscape"
+VOICES = {
+    "en-US-AriaNeural",
+    "en-US-GuyNeural",
+    "en-US-JennyNeural",
+    "en-US-ChristopherNeural",
+    "en-GB-SoniaNeural",
+    "en-GB-RyanNeural",
+    "hi-IN-SwaraNeural",
+    "hi-IN-MadhurNeural",
+}
 
 
 @app.get("/")
 def home():
     return {
         "service": "OFSS AI Video Studio API",
+        "version": "2.1.0",
         "status": "ok",
-        "endpoint": "/api/video"
+        "endpoint": "/api/video",
+        "docs": "/docs",
     }
 
 
-def split_script(script, max_scenes=30):
-    script = re.sub(r"\s+", " ", script.strip())
-    sentences = re.split(r'(?<=[.!?।])\s+', script)
-    sentences = [s.strip() for s in sentences if s.strip()]
-
-    scenes = []
-    current = ""
-
-    for sentence in sentences:
-        if current and len(current) + len(sentence) > 260:
-            scenes.append(current)
-            current = sentence
-        else:
-            current = (current + " " + sentence).strip()
-
-    if current:
-        scenes.append(current)
-
-    if len(scenes) > max_scenes:
-        merged = []
-        for i in range(max_scenes):
-            start = round(i * len(scenes) / max_scenes)
-            end = round((i + 1) * len(scenes) / max_scenes)
-            merged.append(" ".join(scenes[start:end]))
-        scenes = merged
-
-    return scenes or [script]
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "ffmpeg": "available"}
 
 
-def get_font(size, bold=False):
-    paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        if bold else
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"
-    ]
-
-    for path in paths:
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            pass
-
-    return ImageFont.load_default()
-
-
-def wrap_text(draw, text, font, max_width):
-    words = text.split()
-    lines = []
-    current = ""
-
-    for word in words:
-        test = (current + " " + word).strip()
-        box = draw.textbbox((0, 0), test, font=font)
-
-        if box[2] <= max_width or not current:
-            current = test
-        else:
-            lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    return lines
-
-
-def make_scene(text, number, size, folder):
-    width, height = size
-    image = Image.new("RGB", size, (12, 22, 40))
-    draw = ImageDraw.Draw(image)
-
-    # Cinematic gradient background
-    for y in range(height):
-        ratio = y / max(1, height)
-        color = (
-            int(20 - 12 * ratio),
-            int(48 - 35 * ratio),
-            int(75 - 48 * ratio)
+def run_ffmpeg(args):
+    result = subprocess.run(
+        [FFMPEG, "-hide_banner", "-y", *args],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or "FFmpeg failed")[-2000:]
         )
-        draw.line((0, y, width, y), fill=color)
+    return result
 
-    # Decorative circles
-    draw.ellipse(
-        (int(width * 0.65), int(height * 0.08),
-         int(width * 1.05), int(height * 0.48)),
-        outline=(45, 125, 155),
-        width=5
+
+def audio_duration(path):
+    result = subprocess.run(
+        [FFMPEG, "-hide_banner", "-i", str(path), "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
-
-    title_font = get_font(max(18, width // 45), True)
-    scene_font = get_font(max(18, width // 55), True)
-    body_font = get_font(max(22, width // 30))
-    footer_font = get_font(max(14, width // 70))
-
-    draw.text(
-        (int(width * 0.08), int(height * 0.09)),
-        "OFSS AI VIDEO STUDIO",
-        fill=(95, 215, 255),
-        font=title_font
-    )
-
-    draw.text(
-        (int(width * 0.08), int(height * 0.20)),
-        f"SCENE {number:02d}",
-        fill=(255, 190, 90),
-        font=scene_font
-    )
-
-    lines = wrap_text(
-        draw,
+    text = (result.stderr or "") + (result.stdout or "")
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
         text,
-        body_font,
-        int(width * 0.82)
     )
+    if not match:
+        raise RuntimeError("Could not determine audio duration.")
 
-    max_lines = 8 if width > height else 15
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1] + "..."
+    h, m, s = match.groups()
+    duration = int(h) * 3600 + int(m) * 60 + float(s)
 
-    line_height = max(35, height // 14)
-    y = int(height * 0.34)
+    if duration <= 0:
+        raise RuntimeError("Audio duration is zero.")
 
-    for line in lines:
-        draw.text(
-            (int(width * 0.08) + 2, y + 2),
-            line,
-            fill=(0, 0, 0),
-            font=body_font
-        )
-        draw.text(
-            (int(width * 0.08), y),
-            line,
-            fill=(255, 255, 255),
-            font=body_font
-        )
-        y += line_height
-
-    draw.text(
-        (int(width * 0.08), int(height * 0.93)),
-        "EDUCATIONAL DOCUMENTARY",
-        fill=(165, 185, 205),
-        font=footer_font
-    )
-
-    path = os.path.join(folder, f"scene_{number:03d}.jpg")
-    image.save(path, quality=90)
-    return path
-
-
-def camera_motion(clip, duration, scene_number):
-    zoom = 0.06
-
-    if scene_number % 2 == 0:
-        animated = clip.resized(
-            lambda t: 1 + zoom * min(1, t / max(duration, 0.1))
-        )
-    else:
-        animated = clip.resized(
-            lambda t: 1 + zoom * (
-                1 - min(1, t / max(duration, 0.1))
-            )
-        )
-
-    return animated.with_position("center")
+    return duration
 
 
 @app.post("/api/video")
-async def create_video(request: VideoRequest):
-    script = request.script.strip()
-
-    if len(script) < 10:
+async def create_video(
+    images: list[UploadFile] = File(
+        ...,
+        description="Select multiple JPG, PNG, or WebP images",
+    ),
+    script: str = Form(""),
+    voice: str = Form("en-US-AriaNeural"),
+    aspect_ratio: str = Form("16:9"),
+    seconds_per_image: int = Form(8),
+):
+    if not images or len(images) > 40:
         raise HTTPException(
-            status_code=400,
-            detail="Script is too short."
+            400, "Upload between 1 and 40 images."
         )
 
-    if request.format not in ("landscape", "portrait"):
+    if voice not in VOICES:
+        raise HTTPException(400, "Unsupported voice.")
+
+    if aspect_ratio not in ("16:9", "9:16"):
+        raise HTTPException(400, "Choose 16:9 or 9:16.")
+
+    if not 3 <= seconds_per_image <= 30:
         raise HTTPException(
-            status_code=400,
-            detail="Choose landscape or portrait."
+            400, "Seconds per image must be between 3 and 30."
         )
 
-    workdir = tempfile.mkdtemp(prefix="ofss_video_")
-    audio_path = os.path.join(workdir, "voice.mp3")
-    output_path = os.path.join(workdir, "ofss_video.mp4")
+    if len(script) > 12000:
+        raise HTTPException(
+            400, "Script must be under 12,000 characters."
+        )
 
-    audio = None
-    video = None
-    clips = []
+    workdir = Path(tempfile.mkdtemp(prefix="ofss_video_"))
+    output = workdir / "OFSS-AI-Video.mp4"
 
     try:
-        # Generate AI voice
-        communicate = edge_tts.Communicate(
-            script,
-            request.voice,
-            rate="+0%"
-        )
-        await communicate.save(audio_path)
+        valid_images = []
 
-        scenes = split_script(script, 30)
+        for index, upload in enumerate(images):
+            try:
+                if upload.content_type not in {
+                    "image/jpeg", "image/png", "image/webp"
+                }:
+                    continue
 
-        size = (
-            (1280, 720)
-            if request.format == "landscape"
-            else (720, 1280)
-        )
+                data = await upload.read()
 
-        image_paths = [
-            make_scene(text, i + 1, size, workdir)
-            for i, text in enumerate(scenes)
-        ]
+                if not data or len(data) > 12 * 1024 * 1024:
+                    continue
 
-        audio = AudioFileClip(audio_path)
+                suffix = {
+                    "image/jpeg": ".jpg",
+                    "image/png": ".png",
+                    "image/webp": ".webp",
+                }[upload.content_type]
 
-        weights = [
-            max(1, len(scene.split()))
-            for scene in scenes
-        ]
-        total_weight = sum(weights) or 1
+                path = workdir / f"image_{index:03d}{suffix}"
+                path.write_bytes(data)
+                valid_images.append(path)
 
-        for i, path in enumerate(image_paths):
-            duration = (
-                audio.duration * weights[i] / total_weight
+            finally:
+                await upload.close()
+
+        if not valid_images:
+            raise HTTPException(
+                400, "No valid images. Use JPG, PNG, or WebP."
             )
 
-            clip = ImageClip(path).with_duration(
-                max(0.1, duration)
+        voice_path = workdir / "voice.mp3"
+        duration = 0.0
+
+        if script.strip():
+            await edge_tts.Communicate(
+                script.strip(), voice, rate="+0%"
+            ).save(str(voice_path))
+            duration = audio_duration(voice_path)
+
+        if duration <= 0:
+            duration = len(valid_images) * seconds_per_image
+
+        if aspect_ratio == "16:9":
+            width, height = 1280, 720
+        else:
+            width, height = 720, 1280
+
+        fps = 24
+        per_image = duration / len(valid_images)
+        segments = []
+
+        for index, image_path in enumerate(valid_images):
+            segment = workdir / f"segment_{index:03d}.mp4"
+
+            video_filter = (
+                f"scale={width}:{height}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},"
+                "zoompan=z='min(zoom+0.0005,1.08)':"
+                f"d=1:s={width}x{height}:fps={fps},"
+                "format=yuv420p"
             )
 
-            clip = camera_motion(
-                clip,
-                duration,
-                i + 1
-            )
+            run_ffmpeg([
+                "-loop", "1",
+                "-framerate", str(fps),
+                "-i", str(image_path),
+                "-t", str(per_image),
+                "-vf", video_filter,
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                "-r", str(fps),
+                str(segment),
+            ])
 
-            clips.append(clip)
+            if not segment.exists() or segment.stat().st_size == 0:
+                raise RuntimeError(
+                    f"Could not create video segment {index + 1}."
+                )
 
-        video = concatenate_videoclips(
-            clips,
-            method="compose"
+            segments.append(segment)
+
+        concat_path = workdir / "segments.txt"
+        concat_path.write_text(
+            "".join(
+                f"file '{p.as_posix()}'\n" for p in segments
+            ),
+            encoding="utf-8",
         )
 
-        video = video.with_audio(audio)
+        silent_video = workdir / "silent.mp4"
 
-        video.write_videofile(
-            output_path,
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            preset="ultrafast",
-            logger=None
-        )
+        run_ffmpeg([
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_path),
+            "-c", "copy",
+            str(silent_video),
+        ])
 
-        video.close()
-        video = None
+        if script.strip():
+            run_ffmpeg([
+                "-i", str(silent_video),
+                "-i", str(voice_path),
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-shortest",
+                "-movflags", "+faststart",
+                str(output),
+            ])
+        else:
+            shutil.copy2(silent_video, output)
 
-        audio.close()
-        audio = None
-
-        for clip in clips:
-            clip.close()
-
-        clips = []
+        if not output.exists() or output.stat().st_size == 0:
+            raise RuntimeError("MP4 output was not created.")
 
         return FileResponse(
-            output_path,
+            path=str(output),
             media_type="video/mp4",
-            filename="ofss-ai-video.mp4"
+            filename="OFSS-AI-Video.mp4",
+            background=BackgroundTask(
+                shutil.rmtree,
+                str(workdir),
+                ignore_errors=True,
+            ),
         )
 
     except HTTPException:
+        shutil.rmtree(workdir, ignore_errors=True)
         raise
 
     except Exception as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
         raise HTTPException(
-            status_code=500,
-            detail=f"Video creation failed: {str(exc)[:300]}"
+            500,
+            f"Video generation failed: {str(exc)[:700]}",
         )
-
-    finally:
-        if video is not None:
-            video.close()
-
-        if audio is not None:
-            audio.close()
-
-        for clip in clips:
-            try:
-                clip.close()
-            except Exception:
-                pass
